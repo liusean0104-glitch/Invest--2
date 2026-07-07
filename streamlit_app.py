@@ -1,182 +1,190 @@
 """
-streamlit_app.py — DCF 估值引擎的互動式前端
+streamlit_app.py — 台股 DCF 估值工作台(多公司版)
 
-部署到 Streamlit Cloud:把這支檔、dcf_engine.py、requirements.txt
-放在同一個 GitHub repo 根目錄,App 進入點選 streamlit_app.py 即可。
+流程:輸入台股代號 → 自動抓 FinMind 財報 → 產生歷史指標表與建議假設
+     → 使用者微調 → DCF 估值 → 已載入公司可隨時切換、底部跨公司對照。
+
+repo 結構(Streamlit Cloud 部署):
+  streamlit_app.py / dcf_engine.py / data.py / requirements.txt 同層即可。
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 
-from dcf_engine import WACCInputs, DCFAssumptions, DCFModel
+from dcf_engine import DCFAssumptions, DCFModel
+import data as D
 
-st.set_page_config(page_title="DCF 估值引擎", page_icon="📈", layout="wide")
+st.set_page_config(page_title="台股 DCF 工作台", page_icon="📈", layout="wide")
+st.title("📈 台股 DCF 估值工作台")
+st.caption("輸入代號自動抓取財報 → 建議假設 → 估值。單位:億元 / 億股 / 元。教學用途,非投資建議。")
 
-st.title("📈 DCF 估值引擎")
-st.caption("FCFF 折現模型 · Gordon Growth 與 Exit Multiple 雙終值法 · 含 WACC×g 敏感度分析")
+ss = st.session_state
+ss.setdefault("companies", {})     # {ticker: load_company() 的結果}
+ss.setdefault("results", {})       # {ticker: 最後一次估值摘要}
 
 
 # ──────────────────────────────────────────────────────────────
-# 側邊欄:全域假設
+# 載入公司
 # ──────────────────────────────────────────────────────────────
+@st.cache_data(ttl=86400, show_spinner=False)
+def cached_load(ticker: str, token: str):
+    return D.load_company(ticker, token)
+
 with st.sidebar:
-    st.header("假設輸入")
+    st.header("資料來源")
+    token = st.text_input("FinMind API token(選填,免費申請可提高流量)", type="password")
+    st.caption("finmindtrade.com 註冊即可取得")
 
-    st.subheader("公司結構")
-    base_revenue = st.number_input("最近一年營收 (Year 0)", value=5000.0, step=100.0, format="%.1f")
-    net_debt = st.number_input("淨負債（總負債 − 現金 + 少數股權）", value=1500.0, step=100.0, format="%.1f")
-    shares = st.number_input("流通股數", value=1000.0, step=10.0, min_value=0.0001, format="%.1f")
-    tax_rate = st.number_input("稅率 (%)", value=20.0, min_value=0.0, max_value=60.0, step=1.0) / 100
-    n_years = st.slider("明確預測期（年）", 3, 10, 5)
+c1, c2 = st.columns([3, 1])
+ticker_in = c1.text_input("台股代號(例:2308、2330、3017)", value="", placeholder="輸入代號後按載入")
+if c2.button("載入財報", type="primary", use_container_width=True) and ticker_in.strip():
+    t = ticker_in.strip()
+    try:
+        with st.spinner(f"抓取 {t} 財報中…"):
+            ss.companies[t] = cached_load(t, token)
+        st.success(f"{t} 載入完成")
+    except Exception as e:  # noqa: BLE001
+        st.error(f"載入失敗:{e}")
+        st.caption("常見原因:代號錯誤、FinMind 流量上限(可填 token)、或欄位對應需調整(見下方診斷)。")
 
-    st.subheader("折現率 WACC")
-    wacc_mode = st.radio("WACC 來源", ["直接輸入", "用 CAPM 建構"], horizontal=True)
-    if wacc_mode == "直接輸入":
-        wacc = st.number_input("WACC (%)", value=8.84, min_value=0.1, step=0.1) / 100
-    else:
-        rf = st.number_input("無風險利率 rf (%)", value=4.0, step=0.1) / 100
-        beta = st.number_input("Beta（levered）", value=1.10, step=0.05)
-        erp = st.number_input("市場風險溢酬 ERP (%)", value=5.5, step=0.1) / 100
-        kd = st.number_input("稅前債務成本 kd (%)", value=5.0, step=0.1) / 100
-        mcap = st.number_input("股權市值 E", value=8000.0, step=100.0)
-        debt = st.number_input("總負債 D", value=2000.0, step=100.0, min_value=0.0)
-        w_in = WACCInputs(risk_free_rate=rf, beta=beta, equity_risk_premium=erp,
-                          cost_of_debt_pretax=kd, tax_rate=tax_rate,
-                          market_cap=mcap, total_debt=debt)
-        wacc = w_in.wacc()
-        st.caption(f"Cost of Equity：{w_in.cost_of_equity():.2%}　|　**WACC：{wacc:.2%}**")
-
-    st.subheader("終值")
-    terminal_growth = st.number_input("永續成長率 g (%)", value=2.5, step=0.1) / 100
-    exit_mult = st.number_input("Exit EV/EBITDA (×)", value=12.0, min_value=0.0, step=0.5)
-    normalize_terminal = st.checkbox(
-        "終值常態化（CapEx ≈ D&A）", value=True,
-        help="關閉會把擴張期的高 CapEx 永遠帶進終值,通常系統性低估 TV")
-    mid_year = st.checkbox("期中折現慣例（mid-year）", value=False)
-
-    st.subheader("市價對照（選填）")
-    current_price = st.number_input("目前股價（留 0 表示不比較）", value=0.0, min_value=0.0, step=1.0)
-
-
-# ──────────────────────────────────────────────────────────────
-# 主畫面:逐年營運驅動因子（可編輯表格）
-# ──────────────────────────────────────────────────────────────
-def default_drivers(n: int) -> pd.DataFrame:
-    g = np.linspace(12, 5, n)  # 成長率預設從 12% 漸降到 5%
-    return pd.DataFrame({
-        "Year": list(range(1, n + 1)),
-        "營收成長 (%)": np.round(g, 1),
-        "EBIT margin (%)": [22.0] * n,
-        "D&A (% rev)": [5.0] * n,
-        "CapEx (% rev)": [6.0] * n,
-        "NWC (% rev)": [10.0] * n,
-    })
-
-st.subheader("逐年營運假設")
-st.caption("直接點選表格即可編輯每一年的驅動因子（單位皆為 %）")
-drivers = st.data_editor(
-    default_drivers(n_years),
-    key=f"drivers_{n_years}",
-    hide_index=True,
-    width='stretch',
-    disabled=["Year"],
-)
-
-
-# ──────────────────────────────────────────────────────────────
-# 建模
-# ──────────────────────────────────────────────────────────────
-def pct(col):
-    return (drivers[col] / 100).tolist()
-
-assumptions = DCFAssumptions(
-    base_revenue=base_revenue,
-    revenue_growth=pct("營收成長 (%)"),
-    ebit_margin=pct("EBIT margin (%)"),
-    tax_rate=tax_rate,
-    da_pct_revenue=pct("D&A (% rev)"),
-    capex_pct_revenue=pct("CapEx (% rev)"),
-    nwc_pct_revenue=pct("NWC (% rev)"),
-    wacc=wacc,
-    terminal_growth=terminal_growth,
-    net_debt=net_debt,
-    shares_outstanding=shares,
-    forecast_years=n_years,
-    exit_ev_ebitda=exit_mult,
-    mid_year_convention=mid_year,
-    normalize_terminal=normalize_terminal,
-)
-
-try:
-    model = DCFModel(assumptions)
-except Exception as e:  # noqa: BLE001
-    st.error(f"模型建構失敗：{e}")
+if not ss.companies:
+    st.info("先在上方輸入台股代號並載入財報。載入後即可估值,已載入的公司都會留在此頁可切換。")
     st.stop()
 
+active = st.selectbox("目前公司", list(ss.companies.keys()),
+                      index=len(ss.companies) - 1)
+co = ss.companies[active]
+sug = co["suggest"]
+
 
 # ──────────────────────────────────────────────────────────────
-# 結果
+# 歷史指標(建議假設的依據,讓使用者能檢查)
 # ──────────────────────────────────────────────────────────────
-m1, m2, m3 = st.columns(3)
-m1.metric("WACC", f"{wacc:.2%}")
-m2.metric("永續成長率 g", f"{terminal_growth:.2%}")
-m3.metric("預測期", f"{n_years} 年")
+st.subheader(f"{active} 歷史財務指標(億元 / %)")
+hist_cols = [c for c in ["Revenue", "RevenueGrowth%", "OpMargin%", "DA%",
+                         "CapEx%", "NWC%", "TaxRate%"] if c in co["history"].columns]
+st.dataframe(co["history"][hist_cols].style.format("{:,.1f}"), width="stretch")
 
-st.subheader("現金流預測")
-proj = model.proj[["Revenue", "EBIT", "EBITDA", "NOPAT", "D&A",
-                   "CapEx", "ΔNWC", "FCFF", "DiscFactor", "PV_FCFF"]]
-fmt = {c: "{:,.1f}" for c in proj.columns}
-fmt["DiscFactor"] = "{:.3f}"
-st.dataframe(proj.style.format(fmt), width='stretch')
+with st.expander("診斷:本次抓到的原始科目(欄位對不上時看這裡)"):
+    st.write(co["diagnostics"])
+
+
+# ──────────────────────────────────────────────────────────────
+# 假設(以建議值預填;widget key 綁 ticker → 各公司各自記住修改)
+# ──────────────────────────────────────────────────────────────
+st.subheader("估值假設(已用歷史資料預填,可修改)")
+
+k = lambda name: f"{name}_{active}"
+a1, a2, a3, a4 = st.columns(4)
+wacc = a1.number_input("WACC (%)", value=9.0, min_value=0.1, step=0.1, key=k("wacc")) / 100
+tg   = a2.number_input("永續成長率 g (%)", value=2.5, step=0.1, key=k("tg")) / 100
+tax  = a3.number_input("稅率 (%)", value=float(sug["tax_rate_pct"]), step=0.5, key=k("tax")) / 100
+exit_mult = a4.number_input("Exit EV/EBITDA (×)", value=12.0, step=0.5, key=k("exit"))
+
+b1, b2, b3, b4 = st.columns(4)
+n_years = b1.slider("預測年數", 3, 10, 5, key=k("ny"))
+mid_year = b2.checkbox("期中折現", value=True, key=k("mid"))
+norm_tv = b3.checkbox("終值常態化 CapEx≈D&A", value=True, key=k("norm"))
+price = b4.number_input("現價(元)", value=float(co["price"] or 0.0), step=1.0, key=k("px"))
+
+c1, c2, c3 = st.columns(3)
+net_debt = c1.number_input("淨負債(億元)", value=float(co["net_debt"]), step=10.0, key=k("nd"))
+minority = c2.number_input("少數股權(億元)", value=0.0, step=10.0, key=k("mi"),
+                           help="子公司非 100% 持股時必填,否則高估每股價值")
+shares = c3.number_input("流通股數(億股)", value=float(co["shares"]),
+                         min_value=0.0001, step=0.1, key=k("sh"))
+
+st.markdown("**逐年驅動因子(%,可直接編輯)**")
+def _default_drivers():
+    g = sug["growth_pct"][:n_years]
+    g = g + [g[-1]] * (n_years - len(g))
+    return pd.DataFrame({
+        "Year": range(1, n_years + 1),
+        "營收成長 (%)": np.round(g, 1),
+        "營業利益率 (%)": [sug["op_margin_pct"]] * n_years,
+        "D&A (% rev)": [sug["da_pct"]] * n_years,
+        "CapEx (% rev)": [sug["capex_pct"]] * n_years,
+        "NWC (% rev)": [sug["nwc_pct"]] * n_years,
+    })
+drivers = st.data_editor(_default_drivers(), key=k(f"drv{n_years}"),
+                         hide_index=True, width="stretch", disabled=["Year"])
+
+
+# ──────────────────────────────────────────────────────────────
+# 建模與結果
+# ──────────────────────────────────────────────────────────────
+pct = lambda col: (drivers[col] / 100).tolist()
+try:
+    model = DCFModel(DCFAssumptions(
+        base_revenue=co["base_revenue"],
+        revenue_growth=pct("營收成長 (%)"), ebit_margin=pct("營業利益率 (%)"),
+        tax_rate=tax, da_pct_revenue=pct("D&A (% rev)"),
+        capex_pct_revenue=pct("CapEx (% rev)"), nwc_pct_revenue=pct("NWC (% rev)"),
+        wacc=wacc, terminal_growth=tg,
+        net_debt=net_debt, minority_interest=minority, shares_outstanding=shares,
+        base_nwc=co["base_nwc"], forecast_years=n_years,
+        exit_ev_ebitda=exit_mult, mid_year_convention=mid_year,
+        normalize_terminal=norm_tv,
+    ))
+except Exception as e:  # noqa: BLE001
+    st.error(f"模型建構失敗:{e}")
+    st.stop()
 
 st.subheader("估值結果")
-
-def render_value(col, method: str, title: str):
+res_cols = st.columns(2)
+summary = {}
+for col, (meth, title) in zip(res_cols, [("gordon", "Gordon Growth"),
+                                         ("exit_multiple", "Exit Multiple")]):
     try:
-        v = model.value(method)
+        v = model.value(meth)
     except Exception as e:  # noqa: BLE001
-        col.error(f"{title}：{e}")
-        return
+        col.error(f"{title}:{e}")
+        continue
     col.markdown(f"### {title}")
-    if current_price > 0:
-        upside = v["Value_per_Share"] / current_price - 1
-        col.metric("每股價值", f"{v['Value_per_Share']:,.2f}",
-                   delta=f"{upside:+.1%} vs 現價")
+    if price > 0:
+        col.metric("每股價值(元)", f"{v['Value_per_Share']:,.0f}",
+                   delta=f"{v['Value_per_Share']/price-1:+.1%} vs 現價")
     else:
-        col.metric("每股價值", f"{v['Value_per_Share']:,.2f}")
-    col.write(f"企業價值 EV：**{v['Enterprise_Value']:,.0f}**")
-    col.write(f"權益價值：**{v['Equity_Value']:,.0f}**")
-    col.write(f"終值佔 EV：**{v['TV_pct_of_EV']:.1%}**")
+        col.metric("每股價值(元)", f"{v['Value_per_Share']:,.0f}")
+    col.write(f"EV **{v['Enterprise_Value']:,.0f}** 億 | 權益 **{v['Equity_Value']:,.0f}** 億 "
+              f"| 終值佔 EV **{v['TV_pct_of_EV']:.0%}**")
     if v["TV_pct_of_EV"] > 0.80:
-        col.warning("終值佔比 > 80%，估值高度依賴永續假設")
+        col.warning("終值佔比 > 80%,估值高度依賴永續假設")
+    summary[meth] = v["Value_per_Share"]
 
-cG, cE = st.columns(2)
-render_value(cG, "gordon", "Gordon Growth")
-render_value(cE, "exit_multiple", "Exit Multiple")
+ss.results[active] = {
+    "Gordon(元)": summary.get("gordon"),
+    "Exit(元)": summary.get("exit_multiple"),
+    "現價(元)": price if price > 0 else None,
+    "上檔空間": (summary.get("gordon") / price - 1) if (price and summary.get("gordon")) else None,
+}
 
-st.subheader("敏感度分析：每股價值（WACC × g）")
-wacc_grid = np.arange(wacc - 0.01, wacc + 0.011, 0.005)
-g_grid = np.arange(terminal_growth - 0.01, terminal_growth + 0.011, 0.005)
+with st.expander("現金流預測明細"):
+    proj = model.proj[["Revenue", "EBIT", "EBITDA", "NOPAT", "D&A", "CapEx", "ΔNWC",
+                       "FCFF", "PV_FCFF"]]
+    st.dataframe(proj.style.format("{:,.1f}"), width="stretch")
+
+st.subheader("敏感度:每股價值(WACC × g)")
 try:
-    sens = model.sensitivity(wacc_grid, g_grid, "gordon")
-    st.dataframe(
-        sens.style.format("{:,.1f}").background_gradient(cmap="RdYlGn", axis=None),
-        width='stretch',
-    )
+    sens = model.sensitivity(np.arange(wacc - 0.01, wacc + 0.011, 0.005),
+                             np.arange(tg - 0.01, tg + 0.011, 0.005))
+    st.dataframe(sens.style.format("{:,.0f}").background_gradient(cmap="RdYlGn", axis=None),
+                 width="stretch")
 except Exception as e:  # noqa: BLE001
-    st.error(f"敏感度計算失敗：{e}")
+    st.error(f"敏感度計算失敗:{e}")
 
-st.subheader("價值組成（PV 拆解）")
-try:
-    gv = model.value("gordon")
-    comp = pd.DataFrame(
-        {"PV": list(model.proj["PV_FCFF"].values) + [gv["PV_of_TV"]]},
-        index=[f"Y{y}" for y in model.proj.index] + ["終值 TV"],
-    )
-    st.bar_chart(comp)
-except Exception:  # noqa: BLE001
-    pass
+
+# ──────────────────────────────────────────────────────────────
+# 跨公司對照(同一頁比較所有已載入的公司)
+# ──────────────────────────────────────────────────────────────
+if len(ss.results) > 1:
+    st.divider()
+    st.subheader("跨公司對照(各公司最後一次計算)")
+    comp = pd.DataFrame(ss.results).T
+    st.dataframe(comp.style.format({"Gordon(元)": "{:,.0f}", "Exit(元)": "{:,.0f}",
+                                    "現價(元)": "{:,.0f}", "上檔空間": "{:+.1%}"}),
+                 width="stretch")
 
 st.divider()
-st.caption("教學/作品集用途,非投資建議。所有假設可於左側與表格中自行調整。")
+st.caption("資料來源:FinMind。教學/作品集用途,非投資建議。")
