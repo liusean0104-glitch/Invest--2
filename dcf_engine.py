@@ -69,8 +69,12 @@ class DCFAssumptions:
     wacc: float                                 # 折現率
     terminal_growth: float                      # 永續成長率 g
 
-    net_debt: float = 0.0                        # 淨負債 = 總負債 - 現金(+少數股權+特別股)
-    shares_outstanding: float = 1.0              # 流通股數
+    net_debt: float = 0.0                        # 淨負債 = 總負債 − 現金(僅債務,勿混入下面兩項)
+    minority_interest: float = 0.0               # 少數股權(FCFF 是合併口徑 → EV 含少數股東的份,必須扣)
+    preferred_equity: float = 0.0                # 特別股
+    shares_outstanding: float = 1.0              # 流通股數(普通股)
+
+    base_nwc: Optional[float] = None             # year 0 實際 NWC 水位;None 則以 base_revenue×nwc_pct[0] 近似
 
     forecast_years: int = 5                      # 明確預測期長度
     exit_ev_ebitda: Optional[float] = None       # 若用 exit multiple 法的終年 EV/EBITDA
@@ -79,6 +83,9 @@ class DCFAssumptions:
     # 終值常態化(只影響 Gordon 法)。穩態下淨資本支出只該支撐成長 g,
     # 若沿用擴張期的 CapEx%,等於把高資本密集度永遠帶進終值,會系統性低估 TV。
     normalize_terminal: bool = True              # True → 終年令 CapEx ≈ D&A
+    terminal_ronic: Optional[float] = None       # 永續期新投入資本報酬率;給定則改用
+                                                 # FCFF = NOPAT×(1 − g/RONIC)(Damodaran 再投資率法),
+                                                 # 優先於 normalize_terminal
     terminal_ebit_margin: Optional[float] = None     # 終年 margin,None 則沿用最後一年
     terminal_da_pct_revenue: Optional[float] = None  # 終年 D&A%,None 則沿用最後一年
     terminal_nwc_pct_revenue: Optional[float] = None # 終年 NWC%,None 則沿用最後一年
@@ -104,8 +111,8 @@ class DCFModel:
         rows = []
         rev_prev = a.base_revenue
         # year 0 的 NWC 水位,用來算第 1 年的 ΔNWC
-        # 假設 year 0 用第一年的 NWC% 近似 base NWC(實務上可另外給)
-        nwc_prev = a.base_revenue * nwc_pct[0]
+        # 有實際期初 NWC 就用實際值;沒有才以第一年 NWC% 近似
+        nwc_prev = a.base_nwc if a.base_nwc is not None else a.base_revenue * nwc_pct[0]
 
         for t in range(1, n + 1):
             i = t - 1
@@ -145,22 +152,35 @@ class DCFModel:
     def _terminal_fcff(self) -> float:
         """永續期首年(n+1)的常態化 FCFF,供 Gordon 法使用。
 
-        穩態假設:CapEx 趨近 D&A(淨資本支出只支撐成長),
-        NWC 隨營收等比成長 → ΔNWC = 終年水位 − 前一年水位。
+        兩條路徑:
+        1. terminal_ronic 給定 → FCFF = NOPAT×(1 − g/RONIC)
+           (Damodaran 再投資率法:成長 g 需要的再投資 = g/RONIC × NOPAT)
+        2. 否則 → 穩態近似:CapEx ≈ D&A(normalize_terminal=True 時),
+           ΔNWC 用「成長一致」增量 = nwc_pct × rev_n × g。
+           注意不能用 (rev_t×新pct − rev_n×舊pct):若終年 NWC% 被覆寫,
+           那是一次性的水位調整,不該被 Gordon 公式永續化。
         """
         a = self.a
+        g = a.terminal_growth
         rev_n = self.proj.iloc[-1]["Revenue"]
-        rev_t = rev_n * (1 + a.terminal_growth)          # 永續首年營收
+        rev_t = rev_n * (1 + g)                  # 永續首年營收
 
-        margin  = a.terminal_ebit_margin    if a.terminal_ebit_margin    is not None else self._margin_last
-        da_pct  = a.terminal_da_pct_revenue if a.terminal_da_pct_revenue is not None else self._da_pct_last
+        margin = a.terminal_ebit_margin if a.terminal_ebit_margin is not None else self._margin_last
+        nopat = rev_t * margin * (1 - a.tax_rate)
+
+        if a.terminal_ronic is not None:
+            if a.terminal_ronic <= 0:
+                raise ValueError("terminal_ronic 必須為正")
+            if g > a.terminal_ronic:
+                raise ValueError("永續成長率 g 不可大於 RONIC(隱含再投資率 > 100%)")
+            return nopat * (1 - g / a.terminal_ronic)
+
+        da_pct  = a.terminal_da_pct_revenue  if a.terminal_da_pct_revenue  is not None else self._da_pct_last
         nwc_pct = a.terminal_nwc_pct_revenue if a.terminal_nwc_pct_revenue is not None else self._nwc_pct_last
 
-        ebit  = rev_t * margin
-        nopat = ebit * (1 - a.tax_rate)
         da    = rev_t * da_pct
         capex = da if a.normalize_terminal else rev_t * self._cx_pct_last  # 穩態:CapEx ≈ D&A
-        d_nwc = rev_t * nwc_pct - rev_n * self._nwc_pct_last
+        d_nwc = nwc_pct * rev_n * g              # 成長一致的 ΔNWC(只含增量,不含水位跳升)
         return nopat + da - capex - d_nwc
 
     def terminal_value(self, method: str = "gordon"):
@@ -194,7 +214,8 @@ class DCFModel:
         tv, pv_tv = self.terminal_value(method)
 
         ev = pv_fcff_sum + pv_tv                 # 企業價值
-        equity_value = ev - a.net_debt           # EV - 淨負債 = 權益價值
+        # EV → 普通股權益 bridge:FCFF 是合併口徑,EV 含少數股東與特別股的份,必須逐項扣除
+        equity_value = ev - a.net_debt - a.minority_interest - a.preferred_equity
         per_share = equity_value / a.shares_outstanding
 
         return {
@@ -205,6 +226,8 @@ class DCFModel:
             "TV_pct_of_EV": pv_tv / ev,          # 終值佔比(>80% 要警覺)
             "Enterprise_Value": ev,
             "Net_Debt": a.net_debt,
+            "Minority_Interest": a.minority_interest,
+            "Preferred_Equity": a.preferred_equity,
             "Equity_Value": equity_value,
             "Value_per_Share": per_share,
         }
@@ -214,16 +237,19 @@ class DCFModel:
         orig_wacc, orig_g = self.a.wacc, self.a.terminal_growth
         table = pd.DataFrame(index=[f"{w:.1%}" for w in wacc_range],
                              columns=[f"{g:.1%}" for g in g_range], dtype=float)
-        for w in wacc_range:
-            for g in g_range:
-                self.a.wacc, self.a.terminal_growth = w, g
-                self._build_projection()  # WACC 變了,折現因子要重算
-                try:
-                    table.loc[f"{w:.1%}", f"{g:.1%}"] = self.value(method)["Value_per_Share"]
-                except ValueError:
-                    table.loc[f"{w:.1%}", f"{g:.1%}"] = np.nan
-        self.a.wacc, self.a.terminal_growth = orig_wacc, orig_g
-        self._build_projection()
+        try:
+            for w in wacc_range:
+                for g in g_range:
+                    self.a.wacc, self.a.terminal_growth = w, g
+                    self._build_projection()  # WACC 變了,折現因子要重算
+                    try:
+                        table.loc[f"{w:.1%}", f"{g:.1%}"] = self.value(method)["Value_per_Share"]
+                    except ValueError:
+                        table.loc[f"{w:.1%}", f"{g:.1%}"] = np.nan
+        finally:
+            # 無論成功或中途出錯,都把模型狀態還原
+            self.a.wacc, self.a.terminal_growth = orig_wacc, orig_g
+            self._build_projection()
         table.index.name = "WACC \\ g"
         return table
 

@@ -24,6 +24,14 @@ ss.setdefault("companies", {})     # {ticker: load_company() 的結果}
 ss.setdefault("results", {})       # {ticker: 最後一次估值摘要}
 
 
+def get_finmind_token() -> str:
+    """從 st.secrets 讀 FinMind token。沒設定 secrets 檔也不會壞,回空字串(匿名使用)。"""
+    try:
+        return st.secrets.get("FINMIND_TOKEN", "")
+    except Exception:  # 本機沒有 .streamlit/secrets.toml 時 st.secrets 會拋例外
+        return ""
+
+
 # ──────────────────────────────────────────────────────────────
 # 載入公司
 # ──────────────────────────────────────────────────────────────
@@ -33,8 +41,17 @@ def cached_load(ticker: str, token: str):
 
 with st.sidebar:
     st.header("資料來源")
-    token = st.text_input("FinMind API token(選填,免費申請可提高流量)", type="password")
-    st.caption("finmindtrade.com 註冊即可取得")
+    token = get_finmind_token()
+    if token:
+        st.success("已從 secrets 讀取 FinMind token")
+    else:
+        st.warning("未設定 FinMind token —— 可匿名使用,但流量上限低,多載幾家易被擋。")
+        st.caption(
+            "設定方式:\n"
+            "• Streamlit Cloud:App → Settings → Secrets 貼上\n"
+            "  `FINMIND_TOKEN = \"你的token\"`\n"
+            "• 本機:專案內建立 `.streamlit/secrets.toml`,同樣寫一行"
+        )
 
 c1, c2 = st.columns([3, 1])
 ticker_in = c1.text_input("台股代號(例:2308、2330、3017)", value="", placeholder="輸入代號後按載入")
