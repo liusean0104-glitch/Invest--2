@@ -102,3 +102,26 @@ def test_unit_conversion_matches_real_2912_figures():
     bs2 = yearend_balance(rows2)
     assert -190 < bs2.loc["2024", "NetDebt"] < -180     # 應約 -186 億元,不是 -186174 億元
 
+
+# ── 新功能:IFRS 16 租賃負債解析 + 52 週價格區間 ──
+def test_lease_liabilities_parsed():
+    rows = _rows([
+        ["2024-12-31", "2912", "LeaseLiabilitiesCurrent", 3.0e10, "租賃負債-流動"],
+        ["2024-12-31", "2912", "LeaseLiabilitiesNoncurrent", 7.5e10, "租賃負債-非流動"],
+        ["2024-12-31", "2912", "CashAndCashEquivalents", 6.0e10, "現金及約當現金"],
+    ])
+    bs = yearend_balance(rows)
+    assert bs.loc["2024", "LeaseLiab"] == pytest.approx(1050)   # 300+750 億
+    # 租賃負債「不」自動進 NetDebt,由前端決定是否納入
+    assert bs.loc["2024", "NetDebt"] == pytest.approx(-600)
+
+
+def test_price_52w_range():
+    from data import price_52w_range
+    today = pd.Timestamp.today()
+    px = pd.DataFrame({
+        "date": [(today - pd.Timedelta(days=d)).strftime("%Y-%m-%d") for d in (400, 200, 10)],
+        "close": [999.0, 205.0, 268.0]})   # 400 天前的 999 應被排除
+    lo, hi = price_52w_range(px)
+    assert (lo, hi) == (205.0, 268.0)
+    assert price_52w_range(pd.DataFrame()) is None

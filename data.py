@@ -117,6 +117,9 @@ def yearend_balance(df: pd.DataFrame) -> pd.DataFrame:
                                ["短期借款", "應付短期票券", "一年內到期"]),
         "DebtLT":             (["LongTermBorrowings", "BondsPayable"],
                                ["長期借款", "應付公司債"]),
+        "LeaseLiab":          (["LeaseLiabilitiesCurrent", "LeaseLiabilitiesNoncurrent",
+                                "LeaseLiabilitiesNonCurrent"],
+                               ["租賃負債"]),
         "OrdinaryShare":      (["OrdinaryShare", "CommonStocks"], ["普通股股本", "股本合計"]),
     }
     cols = {}
@@ -141,6 +144,17 @@ def latest_close(df: pd.DataFrame) -> float | None:
     if df.empty or "close" not in df:
         return None
     return float(df.sort_values("date")["close"].iloc[-1])
+
+
+def price_52w_range(df: pd.DataFrame) -> tuple[float, float] | None:
+    """近 52 週收盤價區間(football field 用)。"""
+    if df.empty or "close" not in df:
+        return None
+    cutoff = (pd.Timestamp.today() - pd.Timedelta(days=365)).strftime("%Y-%m-%d")
+    s = df[df["date"] >= cutoff]["close"]
+    if s.empty:
+        return None
+    return float(s.min()), float(s.max())
 
 
 # ──────────────────────────────────────────────────────────────
@@ -208,7 +222,7 @@ def load_company(stock_id: str, token: str = "", start_date: str = "2019-01-01")
     cf_raw  = _fetch("TaiwanStockCashFlowsStatement", stock_id, start_date, token)
     bs_raw  = _fetch("TaiwanStockBalanceSheet", stock_id, start_date, token)
     px_raw  = _fetch("TaiwanStockPrice", stock_id,
-                     (pd.Timestamp.today() - pd.Timedelta(days=14)).strftime("%Y-%m-%d"), token)
+                     (pd.Timestamp.today() - pd.Timedelta(days=400)).strftime("%Y-%m-%d"), token)
 
     inc, cf, bs = annual_income(inc_raw), annual_cashflow(cf_raw), yearend_balance(bs_raw)
     hist = build_history(inc, cf, bs)
@@ -222,6 +236,9 @@ def load_company(stock_id: str, token: str = "", start_date: str = "2019-01-01")
     net_debt = float(latest_bs["NetDebt"]) if "NetDebt" in latest_bs else 0.0
     base_revenue = float(hist["Revenue"].iloc[-1])
 
+    def _bs(col):  # 取最新資產負債表單一科目,缺就 0
+        return float(latest_bs[col]) if col in latest_bs and pd.notna(latest_bs[col]) else 0.0
+
     return {
         "stock_id": stock_id,
         "history": hist,
@@ -229,8 +246,12 @@ def load_company(stock_id: str, token: str = "", start_date: str = "2019-01-01")
         "base_revenue": base_revenue,
         "base_nwc": float(latest_bs["NWC"]) if "NWC" in latest_bs else None,
         "net_debt": net_debt,
+        "cash": _bs("Cash"),
+        "total_debt": _bs("DebtST") + _bs("DebtLT"),
+        "lease_liab": _bs("LeaseLiab"),          # IFRS 16 租賃負債(零售/航空等租賃重的公司很關鍵)
         "shares": shares,
         "price": price,
+        "price_52w": price_52w_range(px_raw),
         "warnings": sanity_check(base_revenue, shares, net_debt, price),
         # 診斷:真實欄位名若與關鍵字不合,從這裡看抓到了什麼
         "diagnostics": {

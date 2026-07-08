@@ -72,6 +72,8 @@ class DCFAssumptions:
     net_debt: float = 0.0                        # 淨負債 = 總負債 − 現金(僅債務,勿混入下面兩項)
     minority_interest: float = 0.0               # 少數股權(FCFF 是合併口徑 → EV 含少數股東的份,必須扣)
     preferred_equity: float = 0.0                # 特別股
+    non_operating_assets: float = 0.0            # 非營運資產(長期股權投資、閒置資產等):
+                                                 # 其收益不在 FCFF 內 → 不在 EV 內,須在 bridge 加回
     shares_outstanding: float = 1.0              # 流通股數(普通股)
 
     base_nwc: Optional[float] = None             # year 0 實際 NWC 水位;None 則以 base_revenue×nwc_pct[0] 近似
@@ -214,8 +216,10 @@ class DCFModel:
         tv, pv_tv = self.terminal_value(method)
 
         ev = pv_fcff_sum + pv_tv                 # 企業價值
-        # EV → 普通股權益 bridge:FCFF 是合併口徑,EV 含少數股東與特別股的份,必須逐項扣除
-        equity_value = ev - a.net_debt - a.minority_interest - a.preferred_equity
+        # EV → 普通股權益 bridge:FCFF 是合併口徑,EV 含少數股東與特別股的份,必須逐項扣除;
+        # 非營運資產的收益不在 FCFF 內,必須加回
+        equity_value = (ev - a.net_debt - a.minority_interest - a.preferred_equity
+                        + a.non_operating_assets)
         per_share = equity_value / a.shares_outstanding
 
         return {
@@ -228,9 +232,46 @@ class DCFModel:
             "Net_Debt": a.net_debt,
             "Minority_Interest": a.minority_interest,
             "Preferred_Equity": a.preferred_equity,
+            "Non_Operating_Assets": a.non_operating_assets,
             "Equity_Value": equity_value,
             "Value_per_Share": per_share,
         }
+
+    # ── 交叉檢核:兩種終值法互相反推(banker sanity check)──────
+    def implied_exit_multiple(self) -> float:
+        """Gordon 法終值隱含的終年 EV/EBITDA。
+        若遠高/低於同業交易倍數,代表 (WACC, g) 假設與市場定價不一致。"""
+        tv, _ = self.terminal_value("gordon")
+        return tv / self.proj.iloc[-1]["EBITDA"]
+
+    def implied_terminal_growth(self, lo: float = -0.05) -> Optional[float]:
+        """Exit multiple 法終值隱含的永續成長率 g。
+        解 g 使 Gordon TV(g) = EBITDA_n × exit multiple(二分法)。
+        若解出的 g 高於長期名目 GDP 成長,代表 exit multiple 過於樂觀。"""
+        a = self.a
+        if a.exit_ev_ebitda is None:
+            return None
+        target = self.proj.iloc[-1]["EBITDA"] * a.exit_ev_ebitda
+        orig_g = a.terminal_growth
+
+        def gordon_tv(g: float) -> float:
+            a.terminal_growth = g
+            return self._terminal_fcff() / (a.wacc - g)
+
+        try:
+            hi = a.wacc - 1e-4
+            f_lo, f_hi = gordon_tv(lo) - target, gordon_tv(hi) - target
+            if f_lo * f_hi > 0:          # 目標倍數超出可解區間
+                return None
+            for _ in range(80):
+                mid = (lo + hi) / 2
+                if (gordon_tv(mid) - target) * f_lo <= 0:
+                    hi = mid
+                else:
+                    lo, f_lo = mid, gordon_tv(mid) - target
+            return (lo + hi) / 2
+        finally:
+            a.terminal_growth = orig_g
 
     # ── 敏感度:WACC × 永續成長率 → 每股價值 ──────────────
     def sensitivity(self, wacc_range, g_range, method: str = "gordon") -> pd.DataFrame:
@@ -251,6 +292,28 @@ class DCFModel:
             self.a.wacc, self.a.terminal_growth = orig_wacc, orig_g
             self._build_projection()
         table.index.name = "WACC \\ g"
+        return table
+
+    # ── 敏感度:WACC × Exit EV/EBITDA → 每股價值 ──────────
+    def sensitivity_exit(self, wacc_range, mult_range) -> pd.DataFrame:
+        orig_wacc, orig_mult = self.a.wacc, self.a.exit_ev_ebitda
+        table = pd.DataFrame(index=[f"{w:.1%}" for w in wacc_range],
+                             columns=[f"{m:.1f}×" for m in mult_range], dtype=float)
+        try:
+            for w in wacc_range:
+                self.a.wacc = w
+                self._build_projection()
+                for m in mult_range:
+                    self.a.exit_ev_ebitda = m
+                    try:
+                        table.loc[f"{w:.1%}", f"{m:.1f}×"] = \
+                            self.value("exit_multiple")["Value_per_Share"]
+                    except ValueError:
+                        table.loc[f"{w:.1%}", f"{m:.1f}×"] = np.nan
+        finally:
+            self.a.wacc, self.a.exit_ev_ebitda = orig_wacc, orig_mult
+            self._build_projection()
+        table.index.name = "WACC \\ EV/EBITDA"
         return table
 
 
