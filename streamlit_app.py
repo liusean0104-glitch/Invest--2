@@ -9,16 +9,93 @@ repo 結構(Streamlit Cloud 部署):
   streamlit_app.py / dcf_engine.py / data.py / requirements.txt 同層即可。
 """
 
+import dataclasses
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
 
+import dcf_engine as dcf_engine_module
 from dcf_engine import DCFAssumptions, DCFModel, WACCInputs
 import data as D
 
 st.set_page_config(page_title="台股 DCF 工作台", page_icon="📈", layout="wide")
-st.title("📈 台股 DCF 估值工作台")
+
+# ── JPMorganChase 風格主題:米白底、黑色襯線字、白色分欄搜尋框 ──
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@600;700;900&display=swap');
+
+/* 整頁米白底 */
+.stApp { background-color: #F2EEE4; }
+[data-testid="stHeader"] { background: transparent; }
+section[data-testid="stSidebar"] { background-color: #ECE6D8; }
+
+/* 標題與品牌字:黑色襯線 */
+h1, h2, h3, .brandmark,
+[data-testid="stMetricLabel"] {
+  font-family: "Noto Serif TC", Georgia, "Times New Roman", serif !important;
+  color: #141414;
+}
+.brandmark {
+  text-align: center; font-size: 3.3rem; font-weight: 900;
+  letter-spacing: 0.005em; line-height: 1.15; margin: 1.2rem 0 0.15rem 0;
+}
+.brand-sub {
+  text-align: center; letter-spacing: 0.38em; font-size: 0.78rem;
+  color: #6E675C; margin-bottom: 2.2rem; text-transform: uppercase;
+}
+
+/* 搜尋框內的小型全大寫標籤 */
+.search-label {
+  font-size: 0.72rem; letter-spacing: 0.16em; font-weight: 700;
+  color: #141414; margin: 0.55rem 0 0 0.15rem; text-transform: uppercase;
+  font-family: Georgia, serif;
+}
+
+/* 白色分欄搜尋框(仿 JPMC Find Jobs bar) */
+.st-key-jpmc_search {
+  background: #FFFFFF; border: 1px solid #C8C1B2;
+  padding: 0.35rem 0.35rem 0.85rem 1.2rem; margin-bottom: 1.4rem;
+}
+.st-key-jpmc_search [data-testid="stColumn"]:nth-of-type(2) {
+  border-left: 1px solid #C8C1B2; padding-left: 1.2rem;
+}
+.st-key-jpmc_search [data-testid="stColumn"]:nth-of-type(3) {
+  display: flex; align-items: stretch;
+}
+/* 內部輸入元件去邊框、透明底 */
+.st-key-jpmc_search [data-baseweb="input"],
+.st-key-jpmc_search [data-baseweb="select"] > div,
+.st-key-jpmc_search input {
+  border: none !important; box-shadow: none !important;
+  background: transparent !important; font-size: 1.12rem !important;
+}
+.st-key-jpmc_search [data-testid="stTextInput"] > div,
+.st-key-jpmc_search [data-testid="stSelectbox"] > div {
+  border: none !important; box-shadow: none !important; background: transparent !important;
+}
+/* 放大鏡按鈕:米色方塊 + 棕色圖示 */
+.st-key-jpmc_search .stButton > button {
+  background: #E7E0CE !important; color: #8A5A32 !important;
+  border: none !important; border-radius: 0 !important;
+  height: 3.6rem; width: 100%; font-size: 1.35rem; margin-top: 0.55rem;
+}
+.st-key-jpmc_search .stButton > button:hover { background: #DFD6BF !important; }
+
+/* 分頁籤與主要按鈕統一風格 */
+.stTabs [data-baseweb="tab"] {
+  font-family: "Noto Serif TC", Georgia, serif; letter-spacing: 0.04em;
+}
+.stButton > button[kind="primary"] {
+  background: #141414; color: #FFFFFF; border-radius: 0; border: none;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="brandmark">台股 DCF 估值工作台</div>', unsafe_allow_html=True)
+st.markdown('<div class="brand-sub">Taiwan Equity Valuation Workbench</div>', unsafe_allow_html=True)
 st.caption("輸入代號自動抓取財報 → 建議假設 → 估值。單位:億元 / 億股 / 元。教學用途,非投資建議。")
 
 ss = st.session_state
@@ -55,29 +132,56 @@ with st.sidebar:
             "• 本機:專案內建立 `.streamlit/secrets.toml`,同樣寫一行"
         )
     st.divider()
+    with st.expander("🔧 引擎版本診斷"):
+        st.caption(f"dcf_engine 載入路徑:\n`{dcf_engine_module.__file__}`")
+        _f = {f.name for f in dataclasses.fields(DCFAssumptions)}
+        if "non_operating_assets" in _f:
+            st.success("dcf_engine.py 為最新版(含 non_operating_assets)")
+        else:
+            st.error("dcf_engine.py 為舊版!請 push 最新檔並 Reboot app")
     if st.button("🔄 清除快取並重抓資料", width="stretch",
                  help="data.py 邏輯更新後 st.cache_data 不會自動失效,改完程式務必按一次"):
         cached_load.clear()
         ss.companies, ss.results = {}, {}
         st.rerun()
 
-c1, c2 = st.columns([3, 1])
-ticker_in = c1.text_input("台股代號(例:2308、2330、3017)", value="", placeholder="輸入代號後按載入")
-if c2.button("載入財報", type="primary", width="stretch") and ticker_in.strip():
+# ── 仿 JPMC 搜尋列:左「輸入代號」/ 中「已載入公司」/ 右 放大鏡載入 ──
+with st.container(key="jpmc_search"):
+    col_a, col_b, col_c = st.columns([5, 4, 1])
+    with col_a:
+        st.markdown('<div class="search-label">Find Ticker</div>', unsafe_allow_html=True)
+        ticker_in = st.text_input("台股代號", value="", label_visibility="collapsed",
+                                  placeholder="台股代號:2308、2330、3017 …")
+    with col_b:
+        st.markdown('<div class="search-label">Loaded Companies ▾</div>', unsafe_allow_html=True)
+        _opts = list(ss.companies.keys())
+        if _opts:
+            active = st.selectbox("目前公司", _opts, index=len(_opts) - 1,
+                                  label_visibility="collapsed")
+        else:
+            st.selectbox("目前公司", ["尚未載入公司"], disabled=True,
+                         label_visibility="collapsed")
+            active = None
+    with col_c:
+        do_load = st.button("🔍", key="load_btn", help="載入財報")
+
+if do_load and ticker_in.strip():
     t = ticker_in.strip()
     try:
         with st.spinner(f"抓取 {t} 財報中…"):
             ss.companies[t] = cached_load(t, token)
         st.success(f"{t} 載入完成")
+        active = t
     except Exception as e:  # noqa: BLE001
         st.error(f"載入失敗:{e}")
         st.caption("常見原因:代號錯誤、FinMind 流量上限(可填 token)、或欄位對應需調整(見診斷分頁)。")
 
 if not ss.companies:
-    st.info("先在上方輸入台股代號並載入財報。載入後即可估值,已載入的公司都會留在此頁可切換。")
+    st.info("先在上方搜尋列輸入台股代號並按 🔍 載入財報。載入後即可估值,已載入的公司都會留在下拉選單可切換。")
     st.stop()
 
-active = st.selectbox("目前公司", list(ss.companies.keys()), index=len(ss.companies) - 1)
+if active is None or active not in ss.companies:
+    active = list(ss.companies.keys())[-1]
 co = ss.companies[active]
 sug = co["suggest"]
 k = lambda name: f"{name}_{active}"
@@ -219,10 +323,25 @@ base_kwargs = dict(
     normalize_terminal=norm_tv,
     terminal_ronic=(ronic_in / 100) if ronic_in > 0 else None,
 )
+
+# ── 版本防呆:部署環境的 dcf_engine.py 若是舊版(缺欄位),
+#    不整頁崩潰,改為「略過該參數 + 明確告警」,並指出載入的檔案路徑。──
+_engine_fields = {f.name for f in dataclasses.fields(DCFAssumptions)}
+_dropped = sorted(set(base_kwargs) - _engine_fields)
+if _dropped:
+    st.error(
+        f"⚠️ 偵測到舊版 dcf_engine.py:缺少欄位 {', '.join(_dropped)}。"
+        f"以下計算已**略過**這些參數(視為 0),結果僅供參考。\n\n"
+        f"目前載入的引擎檔案:`{dcf_engine_module.__file__}`\n\n"
+        f"修復:把最新 dcf_engine.py push 到 repo → Streamlit Cloud 選單 **Reboot app**。"
+    )
+    base_kwargs = {k_: v_ for k_, v_ in base_kwargs.items() if k_ in _engine_fields}
+
 try:
     model = DCFModel(DCFAssumptions(**base_kwargs))
 except Exception as e:  # noqa: BLE001
     st.error(f"模型建構失敗:{e}")
+    st.caption(f"引擎檔案路徑:`{dcf_engine_module.__file__}`(若非 repo 內路徑,代表載入到別的舊檔)")
     st.stop()
 
 
@@ -316,10 +435,10 @@ with tab_value:
         st.subheader("EV → 權益 bridge(Gordon 法)")
         v = values["gordon"]
         steps = [("企業價值 EV", v["Enterprise_Value"]),
-                 ("− 淨負債", -v["Net_Debt"]),
-                 ("− 少數股權", -v["Minority_Interest"]),
-                 ("− 特別股", -v["Preferred_Equity"]),
-                 ("+ 非營運資產", v["Non_Operating_Assets"])]
+                 ("− 淨負債", -v.get("Net_Debt", 0.0)),
+                 ("− 少數股權", -v.get("Minority_Interest", 0.0)),
+                 ("− 特別股", -v.get("Preferred_Equity", 0.0)),
+                 ("+ 非營運資產", v.get("Non_Operating_Assets", 0.0))]
         steps = [(n_, x) for n_, x in steps if abs(x) > 1e-9 or n_ == "企業價值 EV"]
         rows, cum = [], 0.0
         for i, (name, amt) in enumerate(steps):
