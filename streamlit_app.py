@@ -369,15 +369,17 @@ with tab_value:
                   f"| 終值佔 EV **{v['TV_pct_of_EV']:.0%}**")
         if v["TV_pct_of_EV"] > 0.80:
             col.warning("終值佔比 > 80%,估值高度依賴永續假設")
-        # 交叉檢核:各法終值反推另一法的隱含參數
+        # 交叉檢核:各法終值反推另一法的隱含參數(舊版引擎無此方法 → 跳過)
         if meth == "gordon":
-            col.caption(f"↔ 隱含 Exit EV/EBITDA:**{model.implied_exit_multiple():.1f}×**"
-                        f"(vs 你輸入的 {exit_mult:.1f}×)")
+            if hasattr(model, "implied_exit_multiple"):
+                col.caption(f"↔ 隱含 Exit EV/EBITDA:**{model.implied_exit_multiple():.1f}×**"
+                            f"(vs 你輸入的 {exit_mult:.1f}×)")
         else:
-            g_imp = model.implied_terminal_growth()
-            col.caption("↔ 隱含永續成長率 g:" +
-                        (f"**{g_imp:.2%}**(vs 你輸入的 {tg:.2%})" if g_imp is not None
-                         else "無解(倍數與 WACC 假設下 Gordon 無法達到此終值)"))
+            if hasattr(model, "implied_terminal_growth"):
+                g_imp = model.implied_terminal_growth()
+                col.caption("↔ 隱含永續成長率 g:" +
+                            (f"**{g_imp:.2%}**(vs 你輸入的 {tg:.2%})" if g_imp is not None
+                             else "無解(倍數與 WACC 假設下 Gordon 無法達到此終值)"))
         summary[meth] = v["Value_per_Share"]
 
     # 兩法差距過大 → 明確提示
@@ -399,14 +401,16 @@ with tab_value:
     try:
         sens_g = model.sensitivity(np.arange(wacc - 0.01, wacc + 0.011, 0.005),
                                    np.arange(tg - 0.005, tg + 0.0051, 0.005))
-        sens_x = model.sensitivity_exit(np.arange(wacc - 0.01, wacc + 0.011, 0.005),
-                                        np.arange(exit_mult - 2, exit_mult + 2.1, 1.0))
         bands = [
             {"方法": "DCF – Gordon(WACC ±1%, g ±0.5%)",
              "low": float(np.nanmin(sens_g.values)), "high": float(np.nanmax(sens_g.values))},
-            {"方法": "DCF – Exit Multiple(WACC ±1%, ±2×)",
-             "low": float(np.nanmin(sens_x.values)), "high": float(np.nanmax(sens_x.values))},
         ]
+        if hasattr(model, "sensitivity_exit"):
+            sens_x = model.sensitivity_exit(np.arange(wacc - 0.01, wacc + 0.011, 0.005),
+                                            np.arange(exit_mult - 2, exit_mult + 2.1, 1.0))
+            bands.append(
+                {"方法": "DCF – Exit Multiple(WACC ±1%, ±2×)",
+                 "low": float(np.nanmin(sens_x.values)), "high": float(np.nanmax(sens_x.values))})
         if co.get("price_52w"):
             lo52, hi52 = co["price_52w"]
             bands.append({"方法": "52 週股價區間", "low": lo52, "high": hi52})
@@ -485,13 +489,16 @@ with tab_sens:
         s1.error(f"敏感度計算失敗:{e}")
 
     s2.markdown("**Exit:每股價值(WACC × EV/EBITDA)**")
-    try:
-        sens2 = model.sensitivity_exit(np.arange(wacc - 0.01, wacc + 0.011, 0.005),
-                                       np.arange(exit_mult - 2, exit_mult + 2.1, 1.0))
-        s2.dataframe(sens2.style.format("{:,.0f}")
-                     .background_gradient(cmap="RdYlGn", axis=None), width="stretch")
-    except Exception as e:  # noqa: BLE001
-        s2.error(f"敏感度計算失敗:{e}")
+    if hasattr(model, "sensitivity_exit"):
+        try:
+            sens2 = model.sensitivity_exit(np.arange(wacc - 0.01, wacc + 0.011, 0.005),
+                                           np.arange(exit_mult - 2, exit_mult + 2.1, 1.0))
+            s2.dataframe(sens2.style.format("{:,.0f}")
+                         .background_gradient(cmap="RdYlGn", axis=None), width="stretch")
+        except Exception as e:  # noqa: BLE001
+            s2.error(f"敏感度計算失敗:{e}")
+    else:
+        s2.info("舊版 dcf_engine.py 無 Exit 敏感度功能——請更新引擎檔後 Reboot。")
 
     # ── 情境分析:Bear / Base / Bull ──
     st.subheader("情境分析(Gordon 法)")
