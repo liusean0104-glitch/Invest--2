@@ -74,6 +74,9 @@ active = st.selectbox("目前公司", list(ss.companies.keys()),
 co = ss.companies[active]
 sug = co["suggest"]
 
+for w in co.get("warnings", []):
+    st.error(f"⚠️ 資料異常:{w}")
+
 
 # ──────────────────────────────────────────────────────────────
 # 歷史指標(建議假設的依據,讓使用者能檢查)

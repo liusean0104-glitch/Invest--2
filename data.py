@@ -18,7 +18,8 @@ import pandas as pd
 import numpy as np
 
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
-THOUSAND_TO_YI = 1e5          # 千元 → 億元(1 億 = 1e8 元 = 1e5 千元)
+DATA_UNIT_TO_YI = 1e8         # 元 → 億元(FinMind 財報 value 欄位單位為「元」,非「千元」;
+                              # 1 億 = 1e8 元。此假設已用真實資料反推驗證,見 CHANGELOG。)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -70,7 +71,7 @@ def annual_income(df: pd.DataFrame) -> pd.DataFrame:
         q["year"] = q.index.str[:4]
         g = q.groupby("year")["v"]
         full = g.count() == 4                      # 只留完整年度
-        cols[name] = (g.sum()[full]) / THOUSAND_TO_YI
+        cols[name] = (g.sum()[full]) / DATA_UNIT_TO_YI
     return pd.DataFrame(cols).dropna(how="all")
 
 
@@ -94,7 +95,7 @@ def annual_cashflow(df: pd.DataFrame) -> pd.DataFrame:
         q["year"] = q.index.str[:4]
         # 累計制:同年取最後一期(通常是 12-31)
         last = q.sort_index().groupby("year")["v"].last()
-        cols[name] = last.abs() / THOUSAND_TO_YI   # CapEx 在現金流出常為負,取絕對值
+        cols[name] = last.abs() / DATA_UNIT_TO_YI   # CapEx 在現金流出常為負,取絕對值
     out = pd.DataFrame(cols).dropna(how="all")
     if {"Depreciation", "Amortization"} & set(out.columns):
         out["DA"] = out.get("Depreciation", 0).fillna(0) + out.get("Amortization", 0).fillna(0)
@@ -125,7 +126,7 @@ def yearend_balance(df: pd.DataFrame) -> pd.DataFrame:
             continue
         q = s.to_frame("v")
         q["year"] = q.index.str[:4]
-        cols[name] = q.sort_index().groupby("year")["v"].last() / THOUSAND_TO_YI
+        cols[name] = q.sort_index().groupby("year")["v"].last() / DATA_UNIT_TO_YI
     out = pd.DataFrame(cols).dropna(how="all")
     if not out.empty:
         get = lambda c: out[c] if c in out else 0.0
@@ -187,6 +188,20 @@ def suggest_assumptions(h: pd.DataFrame, n_years: int = 5) -> dict:
     }
 
 
+def sanity_check(base_revenue: float, shares: float, net_debt: float, price: float | None) -> list[str]:
+    """粗略防呆:數字大到不合理時提醒,通常代表資料來源單位換算有誤(如本次 1000 倍的錯誤)。"""
+    warnings = []
+    if shares > 2000:  # 全台股本最大的公司股數也在千億股以內
+        warnings.append(f"流通股數 {shares:,.0f} 億股明顯過大,疑似單位換算錯誤(通常差 1000 倍)。")
+    if abs(net_debt) > base_revenue * 50:
+        warnings.append(f"淨負債 {net_debt:,.0f} 億元相對營收比例異常,疑似單位換算錯誤。")
+    if price and shares > 0:
+        implied_mktcap = price * shares
+        if implied_mktcap > 500_0000:  # 500 兆元,遠超台股全市場市值,必為錯誤
+            warnings.append("現價 × 股數 隱含市值超過合理範圍,請檢查股數單位。")
+    return warnings
+
+
 def load_company(stock_id: str, token: str = "", start_date: str = "2019-01-01") -> dict:
     """一次抓齊四個資料集並解析。回傳 app 需要的全部東西。"""
     inc_raw = _fetch("TaiwanStockFinancialStatements", stock_id, start_date, token)
@@ -202,15 +217,21 @@ def load_company(stock_id: str, token: str = "", start_date: str = "2019-01-01")
             f"{stock_id} 抓到資料但解析後為空 —— 請看診斷區的原始科目名稱,可能需要調整關鍵字對應。")
 
     latest_bs = bs.iloc[-1] if not bs.empty else pd.Series(dtype=float)
+    price = latest_close(px_raw)
+    shares = float(latest_bs["Shares"]) if "Shares" in latest_bs else 1.0
+    net_debt = float(latest_bs["NetDebt"]) if "NetDebt" in latest_bs else 0.0
+    base_revenue = float(hist["Revenue"].iloc[-1])
+
     return {
         "stock_id": stock_id,
         "history": hist,
         "suggest": suggest_assumptions(hist),
-        "base_revenue": float(hist["Revenue"].iloc[-1]),
+        "base_revenue": base_revenue,
         "base_nwc": float(latest_bs["NWC"]) if "NWC" in latest_bs else None,
-        "net_debt": float(latest_bs["NetDebt"]) if "NetDebt" in latest_bs else 0.0,
-        "shares": float(latest_bs["Shares"]) if "Shares" in latest_bs else 1.0,
-        "price": latest_close(px_raw),
+        "net_debt": net_debt,
+        "shares": shares,
+        "price": price,
+        "warnings": sanity_check(base_revenue, shares, net_debt, price),
         # 診斷:真實欄位名若與關鍵字不合,從這裡看抓到了什麼
         "diagnostics": {
             "income_types": sorted(inc_raw["type"].unique().tolist()) if "type" in inc_raw else [],
